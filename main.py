@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+# events2는 구형 컴포넌트의 Plotly 6 호환 문제를 보완한 대체 패키지다.
 from streamlit_plotly_events import plotly_events
 
 
@@ -455,6 +456,9 @@ def make_map(features, value_map, title, code_property):
     }
     locations = [item["code"] for item in features]
     names = [item["name"] for item in features]
+    # 클릭 이벤트가 text/location 중 어떤 필드를 돌려주더라도 추적할 수 있게
+    # 코드와 표시 이름을 customdata에 함께 넣는다.
+    customdata = [[item["code"], item.get("csv_name") or item["name"]] for item in features]
     values = [float(value_map.get(clean_name(n), 0)) for n in names]
     max_value = max(values + [1])
 
@@ -464,6 +468,7 @@ def make_map(features, value_map, title, code_property):
         z=values,
         featureidkey=f"properties.{code_property}",
         text=names,
+        customdata=customdata,
         colorscale=[
             [0.0, "#F8E9DA"],
             [0.35, "#E8BDA0"],
@@ -495,6 +500,53 @@ def make_map(features, value_map, title, code_property):
         font=dict(color=INK),
     )
     return fig
+
+
+def resolve_map_click(clicks, features):
+    """지도 이벤트의 반환 형식 차이를 흡수해 클릭한 경계 항목을 찾는다."""
+    if not clicks or not features:
+        return None
+    point = clicks[0] if isinstance(clicks, list) else clicks
+    if not isinstance(point, dict):
+        return None
+
+    # GeoJSON Choropleth의 표준 반환값은 location이다.
+    clicked_location = point.get("location")
+    if clicked_location is not None:
+        clicked_location = str(clicked_location).strip()
+        match = next((f for f in features if str(f.get("code", "")).strip() == clicked_location), None)
+        if match:
+            return match
+
+    # 컴포넌트/Plotly 버전에 따라 customdata, text, pointIndex만 오는 경우도 처리한다.
+    custom = point.get("customdata")
+    if isinstance(custom, (list, tuple)) and custom:
+        custom_code = str(custom[0]).strip()
+        match = next((f for f in features if str(f.get("code", "")).strip() == custom_code), None)
+        if match:
+            return match
+        custom_name = clean_name(custom[-1])
+        match = next((f for f in features if clean_name(f.get("name", "")) == custom_name), None)
+        if match:
+            return match
+
+    for field in ("text", "label"):
+        value = point.get(field)
+        if value is not None:
+            cleaned = clean_name(value)
+            match = next((f for f in features if clean_name(f.get("name", "")) == cleaned), None)
+            if match:
+                return match
+
+    for field in ("pointIndex", "pointNumber"):
+        index = point.get(field)
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < len(features):
+            return features[index]
+    return None
 
 
 # ------------------------------------------------------------
@@ -566,7 +618,7 @@ selected_province = st.selectbox(
     key="province_select",
 )
 
-province_df = df[df["시도"] == selected_province].copy()
+province_df = df[df["시도"] == selected_province]
 district_options = sorted([x for x in province_df["시군구"].unique() if x])
 if not district_options:
     district_options = [""]
@@ -580,7 +632,7 @@ selected_district = st.selectbox(
     key="district_select",
 )
 
-district_df = province_df[province_df["시군구"] == selected_district].copy()
+district_df = province_df[province_df["시군구"] == selected_district]
 neighborhood_options = sorted([x for x in district_df["동"].unique() if x])
 if not neighborhood_options:
     neighborhood_options = [""]
@@ -721,15 +773,19 @@ try:
             key="nation_drill_map",
         )
 
-        if clicks:
-            clicked_code = str(clicks[0].get("location", ""))
-            item = next((x for x in nation_features if x["code"] == clicked_code), None)
-            if item and item.get("csv_name") in province_options:
-                st.session_state["pending_province"] = item["csv_name"]
-                st.session_state["pending_district"] = ""
-                st.session_state["pending_neighborhood"] = ""
-                st.session_state["map_level"] = "district"
-                st.rerun()
+        item = resolve_map_click(clicks, nation_features)
+        if item:
+            csv_name = item.get("csv_name")
+            if csv_name in province_options:
+                # 이미 같은 지역으로 이동한 이벤트가 반복 전달되면 무한 rerun하지 않는다.
+                click_signature = f"nation:{item['code']}"
+                if st.session_state.get("last_map_click") != click_signature or st.session_state.get("map_level") != "district":
+                    st.session_state["last_map_click"] = click_signature
+                    st.session_state["pending_province"] = csv_name
+                    st.session_state["pending_district"] = ""
+                    st.session_state["pending_neighborhood"] = ""
+                    st.session_state["map_level"] = "district"
+                    st.rerun()
 
         st.caption("지도에서 시도를 클릭하면 그 지역의 시군구 경계 지도로 전환됩니다.")
 
@@ -763,36 +819,38 @@ try:
                 district_features_for_map = []
                 district_values = {}
 
+                # 먼저 정규화된 이름 사전과 인구 조회 사전을 만들어 반복 필터링을 줄인다.
+                district_name_lookup = {clean_name(name): name for name in district_options}
+                district_population_lookup = {
+                    (clean_name(row["시도"]), clean_name(row["시군구"])): float(row["총인구"])
+                    for _, row in district_summary[["시도", "시군구", "총인구"]].iterrows()
+                }
+                selected_province_key = clean_name(selected_province)
+
                 for item in district_features:
                     copy_item = dict(item)
                     map_name = clean_name(item["name"])
                     full_name = clean_name(item["full_name"])
-                    match_name = None
+                    match_name = district_name_lookup.get(map_name) or district_name_lookup.get(full_name)
 
-                    for candidate in district_options:
-                        candidate_clean = clean_name(candidate)
-                        if (
-                            candidate_clean == map_name
-                            or candidate_clean == full_name
-                            or candidate_clean in full_name
-                            or full_name in candidate_clean
-                        ):
-                            match_name = candidate
-                            break
+                    if match_name is None:
+                        # 예: 지도는 시군구 전체 이름, CSV는 구/시 이름으로 기록된 경우
+                        possible = [
+                            candidate for normalized, candidate in district_name_lookup.items()
+                            if normalized in full_name or full_name in normalized
+                        ]
+                        if possible:
+                            match_name = min(possible, key=lambda candidate: abs(len(clean_name(candidate)) - len(full_name)))
 
                     copy_item["csv_name"] = match_name
                     district_features_for_map.append(copy_item)
 
                     if match_name:
-                        row = district_summary[
-                            (district_summary["시도"] == selected_province)
-                            & (district_summary["시군구"] == match_name)
-                        ]
-                        district_values[map_name] = (
-                            float(row["총인구"].iloc[0]) if not row.empty else 0
+                        district_values[map_name] = district_population_lookup.get(
+                            (selected_province_key, clean_name(match_name)), 0.0
                         )
                     else:
-                        district_values[map_name] = 0
+                        district_values[map_name] = 0.0
 
                 district_fig = make_map(
                     district_features_for_map,
@@ -809,16 +867,19 @@ try:
                     key="district_drill_map",
                 )
 
-                if clicks:
-                    clicked_code = str(clicks[0].get("location", ""))
-                    item = next(
-                        (x for x in district_features_for_map if x["code"] == clicked_code),
-                        None,
-                    )
-                    if item and item.get("csv_name") in district_options:
-                        st.session_state["pending_district"] = item["csv_name"]
-                        st.session_state["pending_neighborhood"] = ""
-                        st.rerun()
+                item = resolve_map_click(clicks, district_features_for_map)
+                if item:
+                    csv_name = item.get("csv_name")
+                    if csv_name in district_options:
+                        click_signature = f"district:{selected_province}:{item['code']}"
+                        # 동일한 이벤트가 다시 전달되면 선택을 반복하지 않는다.
+                        if st.session_state.get("last_map_click") != click_signature or selected_district != csv_name:
+                            st.session_state["last_map_click"] = click_signature
+                            st.session_state["pending_district"] = csv_name
+                            st.session_state["pending_neighborhood"] = ""
+                            st.rerun()
+                    else:
+                        st.info(f"지도에서 {item['name']}을(를) 선택했지만, 인구 CSV에서 같은 이름의 시군구를 찾지 못했습니다. 위의 시군구 선택 메뉴에서 골라 주세요.")
 
                 st.caption(
                     "확대 지도에서 시·군·구를 클릭하면 위의 지역 선택과 아래 상세 정보가 함께 갱신됩니다."
