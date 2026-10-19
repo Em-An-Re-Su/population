@@ -1,6 +1,6 @@
 # main.py
 # 동네별 인구 피라미드 — Streamlit Cloud 배포용
-# 전국 → 시도 확대 → 시군구 선택의 단계형 지도와 상세 인구 UI를 제공한다.
+# 전국 → 시도 → 시군구 → 읍·면·동 단계형 지도와 상세 인구 UI를 제공한다.
 
 import re
 import unicodedata
@@ -10,18 +10,15 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-# 설치된 배포 패키지에 따라 모듈 이름이 다를 수 있어 양쪽 이름을 지원한다.
+# streamlit-plotly-events2 패키지는 기존 모듈 경로를 사용한다.
 try:
-    from streamlit_plotly_events2 import plotly_events
-except ImportError:
-    try:
-        from streamlit_plotly_events import plotly_events
-    except ImportError as exc:
-        raise ImportError(
-            "지도 클릭 기능 패키지를 불러오지 못했습니다. "
-            "requirements.txt에 streamlit-plotly-events2==0.0.7이 있는지 확인한 뒤 "
-            "Streamlit Cloud에서 앱을 재부팅하세요."
-        ) from exc
+    from streamlit_plotly_events import plotly_events
+except ImportError as exc:
+    raise ImportError(
+        "지도 클릭 패키지를 불러오지 못했습니다. requirements.txt에 "
+        "streamlit-plotly-events2==0.0.7이 있는지 확인하고, "
+        "Streamlit Cloud에서 앱을 재부팅해 주세요."
+    ) from exc
 
 
 # ------------------------------------------------------------
@@ -85,6 +82,10 @@ PROVINCE_GEOJSON_URL = (
 DISTRICT_GEOJSON_URL = (
     "https://raw.githubusercontent.com/"
     "KnellBalm/kr-admin-geojson/main/sig.geojson"
+)
+NEIGHBORHOOD_GEOJSON_URL = (
+    "https://raw.githubusercontent.com/"
+    "KnellBalm/kr-admin-geojson/main/emd.geojson"
 )
 
 
@@ -243,6 +244,56 @@ def get_district_features(geojson, province_code):
                 "code": code,
             })
 
+    return result
+
+
+def get_neighborhood_features(geojson, province_code, district_code, csv_names):
+    """선택한 시군구에 속하는 읍·면·동 지도 피처를 만든다.
+
+    EMD GeoJSON은 법정동 경계를 포함하며, HJD_NM(행정동명)도 제공한다.
+    같은 행정동에 속한 법정동 조각은 같은 CSV 인구값으로 색칠하고,
+    클릭하면 해당 행정동을 선택하도록 연결한다.
+    """
+    lookup = {clean_name(name): name for name in csv_names if str(name).strip()}
+    result = []
+    for feature in geojson.get("features", []):
+        props = feature.get("properties", {})
+        sig_code = str(props.get("SIG_CD", "")).strip()
+        sido_code = str(props.get("CTPRVN_CD", sig_code[:2])).strip()
+        if sig_code != str(district_code).strip():
+            continue
+        if province_code and sido_code and sido_code != str(province_code).strip():
+            continue
+
+        emd_code = props.get("EMD_CD")
+        emd_name = props.get("EMD_KOR_NM") or props.get("name")
+        admin_name = props.get("HJD_NM")
+        full_name = props.get("FULL_NM") or emd_name or admin_name
+        if emd_code is None or not (emd_name or admin_name):
+            continue
+
+        # 우선 행정동명(HJD_NM)을 CSV의 읍면동명과 매칭하고,
+        # 없으면 법정동 이름을 사용한다.
+        csv_name = lookup.get(clean_name(admin_name)) if admin_name else None
+        if csv_name is None and emd_name:
+            csv_name = lookup.get(clean_name(emd_name))
+        if csv_name is None and full_name:
+            normalized_full = clean_name(full_name)
+            candidates = [
+                original for normalized, original in lookup.items()
+                if normalized and (normalized in normalized_full or normalized_full.endswith(normalized))
+            ]
+            if candidates:
+                csv_name = min(candidates, key=lambda x: abs(len(clean_name(x)) - len(normalized_full)))
+
+        result.append({
+            "feature": feature,
+            "name": str(admin_name or emd_name).strip(),
+            "legal_name": str(emd_name or admin_name).strip(),
+            "full_name": str(full_name).strip(),
+            "code": str(emd_code).strip(),
+            "csv_name": csv_name,
+        })
     return result
 
 
@@ -588,6 +639,7 @@ female_cols = [f"여_{age}" for age in age_labels if f"여_{age}" in df.columns]
 # 같은 읍면동이 중복으로 기록된 경우에는 연령별 인구를 먼저 합산한다.
 province_summary = aggregate_region(df, ["시도"], age_labels)
 district_summary = aggregate_region(df, ["시도", "시군구"], age_labels)
+neighborhood_summary = aggregate_region(df, ["시도", "시군구", "동"], age_labels)
 
 province_options = sorted([x for x in df["시도"].unique() if x])
 if not province_options:
@@ -715,8 +767,8 @@ else:
 st.divider()
 st.header("🗺️ 지도에서 지역 탐색하기")
 st.markdown(
-    "전국 지도에서 시도를 클릭하면 그 지역이 확대됩니다. "
-    "확대된 지도에서 시·군·구를 클릭하면 해당 지역의 인구 정보가 아래에 표시됩니다."
+    "전국 지도에서 시도를 클릭하고, 확대 지도에서 시·군·구를 선택한 뒤 "
+    "읍·면·동 경계까지 한 단계 더 확대해 살펴볼 수 있습니다."
 )
 
 if "map_level" not in st.session_state:
@@ -739,6 +791,7 @@ def canonical_province(name):
 try:
     province_geojson = load_geojson(PROVINCE_GEOJSON_URL)
     district_geojson = load_geojson(DISTRICT_GEOJSON_URL)
+    neighborhood_geojson = load_geojson(NEIGHBORHOOD_GEOJSON_URL)
     province_features = get_province_features(province_geojson)
 
     if not province_features:
@@ -799,7 +852,7 @@ try:
 
         st.caption("지도에서 시도를 클릭하면 그 지역의 시군구 경계 지도로 전환됩니다.")
 
-    else:
+    elif st.session_state["map_level"] == "district":
         selected_map_province = canonical_province(selected_province)
         province_code = next(
             (
@@ -887,12 +940,106 @@ try:
                             st.session_state["last_map_click"] = click_signature
                             st.session_state["pending_district"] = csv_name
                             st.session_state["pending_neighborhood"] = ""
+                            st.session_state["map_level"] = "neighborhood"
+                            st.session_state["selected_district_code"] = item["code"]
                             st.rerun()
                     else:
                         st.info(f"지도에서 {item['name']}을(를) 선택했지만, 인구 CSV에서 같은 이름의 시군구를 찾지 못했습니다. 위의 시군구 선택 메뉴에서 골라 주세요.")
 
                 st.caption(
-                    "확대 지도에서 시·군·구를 클릭하면 위의 지역 선택과 아래 상세 정보가 함께 갱신됩니다."
+                    "시·군·구를 클릭하면 해당 지역의 읍·면·동 경계 지도로 한 단계 더 확대됩니다."
+                )
+
+    elif st.session_state["map_level"] == "neighborhood":
+        selected_map_province = canonical_province(selected_province)
+        province_code = next(
+            (item["code"] for item in province_features
+             if clean_name(canonical_province(item["name"])) == clean_name(selected_map_province)),
+            None,
+        )
+        district_features = get_district_features(district_geojson, province_code) if province_code else []
+        district_code = st.session_state.get("selected_district_code")
+
+        # 드롭다운에서 지역을 바꿔 온 경우에는 시군구 이름으로 코드도 다시 찾는다.
+        if not district_code or not any(str(x.get("code")) == str(district_code) for x in district_features):
+            normalized_target = clean_name(selected_district)
+            exact = [x for x in district_features
+                     if clean_name(x["name"]) == normalized_target
+                     or clean_name(x["full_name"]) == normalized_target]
+            if not exact:
+                exact = [x for x in district_features
+                         if normalized_target and (normalized_target in clean_name(x["full_name"])
+                                                   or clean_name(x["name"]) in normalized_target)]
+            district_code = exact[0]["code"] if exact else None
+
+        back_col, title_col, national_col = st.columns([1.25, 3, 1.25])
+        with back_col:
+            if st.button("← 시·군·구 지도", use_container_width=True):
+                st.session_state["map_level"] = "district"
+                st.rerun()
+        with title_col:
+            st.subheader(f"{selected_province} {selected_district} 읍·면·동 확대 지도")
+        with national_col:
+            if st.button("전국으로 돌아가기", use_container_width=True):
+                st.session_state["map_level"] = "nation"
+                st.rerun()
+
+        if not district_code:
+            st.warning("선택한 시군구의 지도 코드를 찾지 못했습니다. 시군구를 다시 선택해 주세요.")
+        else:
+            neighborhood_options_for_map = [x for x in neighborhood_options if x]
+            neighborhood_features = get_neighborhood_features(
+                neighborhood_geojson, province_code, district_code, neighborhood_options_for_map
+            )
+            if not neighborhood_features:
+                st.warning("이 시군구의 읍·면·동 경계 자료를 찾지 못했습니다. 위의 읍·면·동 선택 메뉴는 계속 사용할 수 있습니다.")
+            else:
+                neighborhood_population_lookup = {
+                    clean_name(row["동"]): float(row["총인구"])
+                    for _, row in neighborhood_summary[
+                        (neighborhood_summary["시도"] == selected_province)
+                        & (neighborhood_summary["시군구"] == selected_district)
+                    ][["동", "총인구"]].iterrows()
+                }
+                # 행정동명이 여러 법정동 경계와 연결될 수 있어 동일 인구값을 공유한다.
+                neighborhood_values = {}
+                for item in neighborhood_features:
+                    neighborhood_values[clean_name(item["name"])] = neighborhood_population_lookup.get(
+                        clean_name(item.get("csv_name") or item["name"]), 0.0
+                    )
+
+                neighborhood_fig = make_map(
+                    neighborhood_features,
+                    neighborhood_values,
+                    f"{selected_province} {selected_district} 읍·면·동별 총인구",
+                    "EMD_CD",
+                )
+                clicks = plotly_events(
+                    neighborhood_fig,
+                    click_event=True,
+                    select_event=False,
+                    hover_event=False,
+                    override_height=640,
+                    key=f"neighborhood_drill_map_{clean_name(selected_province)}_{clean_name(selected_district)}",
+                )
+                item = resolve_map_click(clicks, neighborhood_features)
+                if item:
+                    csv_name = item.get("csv_name")
+                    if csv_name in neighborhood_options:
+                        click_signature = f"neighborhood:{selected_province}:{selected_district}:{item['code']}"
+                        if (st.session_state.get("last_map_click") != click_signature
+                                or selected_neighborhood != csv_name):
+                            st.session_state["last_map_click"] = click_signature
+                            st.session_state["pending_neighborhood"] = csv_name
+                            st.rerun()
+                    else:
+                        st.info(
+                            f"지도 경계 '{item['legal_name']}'를 인구 CSV의 읍·면·동과 자동 연결하지 못했습니다. "
+                            "위의 읍·면·동 선택 메뉴에서 지역을 선택할 수 있습니다."
+                        )
+                st.caption(
+                    "지도에서 읍·면·동을 클릭하면 인구 피라미드와 상세 인구 지표가 해당 지역 기준으로 갱신됩니다. "
+                    "경계는 법정동 단위이며, 인구값은 가능한 경우 연결된 행정동 기준으로 표시합니다."
                 )
 
 except Exception as exc:
@@ -909,23 +1056,28 @@ except Exception as exc:
 st.divider()
 st.header("🏘️ 지역 인구 상세 정보")
 st.markdown(
-    f"<p class='small-note'>선택 지역: <b>{selected_province} {selected_district}</b> · 기준 연도: {latest_year}년</p>",
+    f"<p class='small-note'>선택 지역: <b>{selected_province} {selected_district} {selected_neighborhood}</b> · 기준 연도: {latest_year}년</p>",
     unsafe_allow_html=True,
 )
 
+local_row_df = neighborhood_summary[
+    (neighborhood_summary["시도"] == selected_province)
+    & (neighborhood_summary["시군구"] == selected_district)
+    & (neighborhood_summary["동"] == selected_neighborhood)
+]
 district_row_df = district_summary[
     (district_summary["시도"] == selected_province)
     & (district_summary["시군구"] == selected_district)
 ]
 
-if district_row_df.empty:
-    st.info("선택한 시군구의 집계 정보를 찾을 수 없습니다.")
+if local_row_df.empty:
+    st.info("선택한 읍·면·동의 집계 정보를 찾을 수 없습니다.")
 else:
-    district_row = district_row_df.iloc[0]
+    district_row = local_row_df.iloc[0]
     metrics = population_metrics(district_row, age_labels)
 
     # 핵심 지표를 별도 카드 형태로 표시한다.
-    st.subheader("한눈에 보는 인구 현황")
+    st.subheader("선택한 읍·면·동의 인구 현황")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("총인구", f"{fmt_number(metrics['total'])}명")
     c2.metric("남녀 성비", f"{fmt_ratio(metrics['sex_ratio'])}", help="여자 100명당 남자 수")
@@ -937,6 +1089,33 @@ else:
     c6.metric("15~64세", f"{fmt_number(metrics['working'])}명")
     c7.metric("65세 이상", f"{fmt_number(metrics['elderly'])}명")
     c8.metric("80세 이상", f"{fmt_number(metrics['elderly80'])}명")
+
+    st.markdown("#### 지역 고령화·부양 지표")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("고령화율 (65세 이상)", fmt_percent(metrics["elderly_share"]))
+    r2.metric("유소년 비율 (0~14세)", fmt_percent(metrics["children_share"]))
+    r3.metric("노령화 지수", fmt_ratio(metrics["aging_index"]), help="65세 이상 인구 ÷ 0~14세 인구 × 100")
+    r4.metric("총부양비", fmt_ratio(metrics["dependency_ratio"]), help="(0~14세 + 65세 이상) ÷ 15~64세 × 100")
+
+    if not district_row_df.empty:
+        district_metrics = population_metrics(district_row_df.iloc[0], age_labels)
+        st.markdown("#### 읍·면·동과 시·군·구 비교")
+        compare_df = pd.DataFrame({
+            "지표": ["총인구", "고령화율", "유소년 비율", "생산연령인구 비율", "80세 이상 비율", "노령화 지수", "총부양비"],
+            "선택한 읍·면·동": [
+                f"{fmt_number(metrics['total'])}명", fmt_percent(metrics['elderly_share']),
+                fmt_percent(metrics['children_share']), fmt_percent(metrics['working_share']),
+                fmt_percent(metrics['elderly80_share']), fmt_ratio(metrics['aging_index']),
+                fmt_ratio(metrics['dependency_ratio']),
+            ],
+            "시·군·구 전체": [
+                f"{fmt_number(district_metrics['total'])}명", fmt_percent(district_metrics['elderly_share']),
+                fmt_percent(district_metrics['children_share']), fmt_percent(district_metrics['working_share']),
+                fmt_percent(district_metrics['elderly80_share']), fmt_ratio(district_metrics['aging_index']),
+                fmt_ratio(district_metrics['dependency_ratio']),
+            ],
+        })
+        st.dataframe(compare_df, use_container_width=True, hide_index=True)
 
     # 탭으로 정보가 서로 섞이지 않게 분리한다.
     tab_overview, tab_age, tab_table = st.tabs(
@@ -1034,6 +1213,6 @@ else:
 st.divider()
 st.caption(
     "데이터: 제공된 전국 읍·면·동 인구 ZIP CSV. "
-    "행정구역 경계: kr-admin-geojson 공개 GeoJSON(시도·시군구). "
+    "행정구역 경계: kr-admin-geojson 공개 GeoJSON(시도·시군구·법정동). "
     "지도 경계 이름과 인구 CSV의 행정구역 이름이 다르면 지도 클릭 연결이 일부 제한될 수 있습니다."
 )
