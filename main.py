@@ -10,8 +10,18 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-# events2는 구형 컴포넌트의 Plotly 6 호환 문제를 보완한 대체 패키지다.
-from streamlit_plotly_events import plotly_events
+# 설치된 배포 패키지에 따라 모듈 이름이 다를 수 있어 양쪽 이름을 지원한다.
+try:
+    from streamlit_plotly_events2 import plotly_events
+except ImportError:
+    try:
+        from streamlit_plotly_events import plotly_events
+    except ImportError as exc:
+        raise ImportError(
+            "지도 클릭 기능 패키지를 불러오지 못했습니다. "
+            "requirements.txt에 streamlit-plotly-events2==0.0.7이 있는지 확인한 뒤 "
+            "Streamlit Cloud에서 앱을 재부팅하세요."
+        ) from exc
 
 
 # ------------------------------------------------------------
